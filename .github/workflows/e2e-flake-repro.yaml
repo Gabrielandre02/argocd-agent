@@ -1,0 +1,133 @@
+name: E2E flake repro (fork only)
+on:
+  push:
+    branches:
+      - 'ci/e2e-flake-repro'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: repro namespaced-mapping #${{ matrix.attempt }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    env:
+      GOPATH: /home/runner/go
+      E2E_RUN: '^(TestAdoptionTestSuite|TestCacheTestSuite|TestApplicationSuite)$'
+    steps:
+      - name: Install required packages
+        run: |
+          sudo apt-get install libpwquality-tools
+      - name: Free up some disk space
+        run: |
+          df -h
+          sudo apt clean
+          sudo docker system prune -a -f
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/share/swift
+          df -h
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Golang
+        uses: actions/setup-go@0c52d547c9bc32b1aa3301fd7a9cb496313a4491 # v5.0.0
+        with:
+          go-version-file: go.mod
+      - name: GH actions workaround - Kill XSP4 process
+        run: |
+          sudo pkill mono || true
+      - name: Install microk8s
+        run: |
+          set -x
+          sudo snap install --classic --channel 1.31/stable microk8s
+          sudo microk8s enable metallb:192.168.56.100-192.168.56.254
+          sudo microk8s enable hostpath-storage
+          mkdir -p $HOME/.kube
+          sudo microk8s config > $HOME/.kube/config
+          sudo chown runner $HOME/.kube/config
+          sudo chmod go-r $HOME/.kube/config
+          kubectl version
+      - name: Add ~/go/bin to PATH
+        run: |
+          echo "/home/runner/go/bin" >> $GITHUB_PATH
+      - name: Add /usr/local/bin to PATH
+        run: |
+          echo "/usr/local/bin" >> $GITHUB_PATH
+      - name: Install vcluster
+        run: |
+          curl -L -o vcluster "https://github.com/loft-sh/vcluster/releases/latest/download/vcluster-linux-amd64" && sudo install -c -m 0755 vcluster /usr/local/bin && rm -f vcluster
+          vcluster --version
+      - name: Download Go dependencies
+        run: |
+          go mod download
+      - name: Set up the test environment
+        run: |
+          set -o pipefail
+          date -u +%FT%T.%NZ | tee /tmp/setup-e2e.log
+          make setup-e2e 2>&1 | tee -a /tmp/setup-e2e.log
+          date -u +%FT%T.%NZ | tee -a /tmp/setup-e2e.log
+      - name: Snapshot AppProjects right after setup
+        run: |
+          {
+            date -u +%FT%T.%NZ
+            kubectl --context vcluster-control-plane get appproject -A -o wide
+            kubectl --context vcluster-control-plane -n argocd-principal get appproject default -o yaml
+            kubectl --context vcluster-control-plane -n argocd-principal get pods -o wide
+          } 2>&1 | tee /tmp/appprojects-after-setup.log || true
+      - name: Watch the principal default AppProject
+        run: |
+          nohup bash -c 'while true; do
+            printf "%s " "$(date -u +%T.%N)"
+            kubectl --context vcluster-control-plane -n argocd-principal get appproject default \
+              -o jsonpath="uid={.metadata.uid} rv={.metadata.resourceVersion} created={.metadata.creationTimestamp} deleting={.metadata.deletionTimestamp} labels={.metadata.labels}" 2>&1
+            echo
+            sleep 2
+          done' > /tmp/default-appproject-watch.log 2>&1 &
+          sleep 3
+          cat /tmp/default-appproject-watch.log
+      - name: Run the principal and agents
+        run: |
+          make all
+          make start-e2e 2>&1 | sed -r "s/[[:cntrl:]]\[[0-9]{1,3}m//g" | tee /tmp/e2e-argocd-agent.log &
+      - name: Run the e2e tests
+        run: |
+          set -o pipefail
+          make test-e2e 2>&1 | tee /tmp/test-e2e.log
+          goreman run stop-all || echo "goreman trouble"
+          sleep 30
+      - name: Collect cluster state
+        if: ${{ always() }}
+        run: |
+          kubectl --context vcluster-control-plane logs -n argocd-principal deployment/argocd-server > /tmp/vcluster-control-plane-server.log || true
+          kubectl --context vcluster-control-plane get events -A --sort-by=.lastTimestamp > /tmp/control-plane-events.log 2>&1 || true
+          kubectl --context vcluster-control-plane -n argocd-principal get appproject -o wide > /tmp/appprojects-at-end.log 2>&1 || true
+      - name: Upload diagnostics (always)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: diag-${{ matrix.attempt }}
+          path: |
+            /tmp/setup-e2e.log
+            /tmp/appprojects-after-setup.log
+            /tmp/default-appproject-watch.log
+            /tmp/control-plane-events.log
+            /tmp/appprojects-at-end.log
+            /tmp/vcluster-control-plane-server.log
+      - name: Upload test and process logs (failure only)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: failure-logs-${{ matrix.attempt }}
+          path: |
+            /tmp/test-e2e.log
+            /tmp/e2e-argocd-agent.log
